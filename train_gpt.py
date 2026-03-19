@@ -135,7 +135,7 @@ def normuon_update(
     update = update.to(grad.dtype)
     if original_shape is not None:
         update = update.reshape(original_shape)
-    # NorMuon: per-row second-moment normalization for stable updates
+    # Normalize per-row by second-moment EMA, then rescale to preserve overall norm
     vnorm = update.norm(dim=(-2, -1), keepdim=True)
     v_mean = torch.mean(update * update, dim=-1, keepdim=True)
     second_momentum_buf.lerp_(v_mean, 1 - beta2)
@@ -148,8 +148,7 @@ def normuon_update(
 
 
 class Muon(torch.optim.Optimizer):
-    # NorMuon: Muon with per-row second-moment normalization.
-    # When use_normuon=True, uses the normuon_update path from SOTA submissions.
+    # use_normuon=True adds per-row second-moment normalization after NS5 (from modded-nanogpt).
     def __init__(self, params, lr: float, momentum: float, backend_steps: int,
                  nesterov: bool = True, beta2: float = 0.95, use_normuon: bool = False):
         super().__init__(
@@ -181,8 +180,6 @@ class Muon(torch.optim.Optimizer):
             beta2 = group.get("beta2", 0.95)
 
             if use_normuon:
-                # NorMuon path: per-parameter update with second-moment normalization
-                # Sort params largest-first for better distributed load balance
                 params_sorted = sorted(params, key=lambda x: x.size(), reverse=True)
                 pad_count = (-len(params_sorted)) % world_size
                 params_pad = params_sorted + [torch.empty_like(params_sorted[-1]) for _ in range(pad_count)]
@@ -362,14 +359,13 @@ def eval_val_sliding_window(
     is_boundary_token_lut: Tensor,
     stride: int,
 ) -> tuple[float, float]:
-    # Sliding window evaluation: score each token with near-maximum context.
-    # For each window of seq_len tokens, only the last `stride` tokens are scored.
-    # This gives each scored token at least (seq_len - stride) context tokens.
+    # Each token gets scored with at least (seq_len - stride) context,
+    # vs the standard eval where context ranges from 0 to seq_len-1.
     seq_len = args.train_seq_len
-    total_tokens_available = val_tokens.numel() - 1  # -1 because we need target
-    # Generate all window start positions
+    if stride >= seq_len:
+        raise ValueError(f"SLIDING_WINDOW_STRIDE={stride} must be < TRAIN_SEQ_LEN={seq_len}")
+    total_tokens_available = val_tokens.numel() - 1
     window_starts = list(range(0, total_tokens_available - seq_len + 1, stride))
-    # Distribute windows across ranks
     rank_starts = window_starts[rank::world_size]
 
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
@@ -384,7 +380,6 @@ def eval_val_sliding_window(
             y = window[1:].unsqueeze(0)   # (1, seq_len)
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                # Get logits for the full window but only score the last `stride` tokens
                 hidden = model.tok_emb(x)
                 hidden = F.rms_norm(hidden, (hidden.size(-1),))
                 x0 = hidden
@@ -400,11 +395,8 @@ def eval_val_sliding_window(
                     hidden = model.blocks[(model.num_encoder_layers + i) % model.num_unique_blocks](hidden, x0, lora_q=lq, lora_v=lv)
                 hidden = model.final_norm(hidden)
 
-                # Only score the last `stride` positions
-                score_start = seq_len - stride
-                # Handle first window: score all positions (no prior context)
-                if start == 0:
-                    score_start = 0
+                # Only score the last `stride` positions; first window scores everything
+                score_start = 0 if start == 0 else seq_len - stride
                 h_score = hidden[:, score_start:, :].reshape(-1, hidden.size(-1))
                 t_score = y[:, score_start:].reshape(-1)
 
@@ -418,7 +410,6 @@ def eval_val_sliding_window(
             n_scored = t_score.numel()
             val_loss_sum += loss.to(torch.float64)
             val_token_count += float(n_scored)
-            # Byte counting for BPB
             prev_ids = x[:, score_start:].reshape(-1)
             tgt_ids = t_score
             token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
@@ -669,9 +660,7 @@ INT6_CLIP_Q = 0.9999984  # quantile for outlier clipping — matches export
 
 
 def _fake_quantize_per_row(w: Tensor, bits: int) -> Tensor:
-    # STE fake quantize: forward simulates post-training int-N quantization,
-    # backward passes gradients through unchanged (straight-through estimator).
-    # Uses quantile-based outlier clipping to match the actual export procedure.
+    # STE: simulate post-training int-N per-row quantization with quantile clipping.
     max_val = (1 << (bits - 1)) - 1  # 127 for int8, 31 for int6
     with torch.no_grad():
         w32 = w.float()
@@ -679,14 +668,11 @@ def _fake_quantize_per_row(w: Tensor, bits: int) -> Tensor:
         scale = clip_abs / max_val
         w_clipped = torch.clamp(w32, -clip_abs[:, None], clip_abs[:, None])
         w_q = (torch.round(w_clipped / scale[:, None]) * scale[:, None]).to(w.dtype)
-    # STE: forward uses quantized weights, backward passes through
-    return w + (w_q - w).detach()
+    return w + (w_q - w).detach()  # STE: gradient flows through unchanged
 
 
 class CastedLinear(nn.Linear):
-    # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
-    # Optional STE fake quantization for quantization-aware training.
-    fake_quant_bits: int = 0  # set by main() from args.fake_quant_bits
+    fake_quant_bits: int = 0  # class-level, set by main() from args
 
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight.to(x.dtype)
@@ -880,16 +866,15 @@ class GPT(nn.Module):
                 for i in range(num_layers)
             ]
         )
-        # Per-loop LoRA: one pair (Q, V) per virtual layer when depth_recurrence > 1
+        # Per-loop LoRA on Q and V lets each virtual layer specialize
         self.lora_q = nn.ModuleList()
         self.lora_v = nn.ModuleList()
         if lora_rank > 0 and depth_recurrence > 1:
             kv_dim = (num_kv_heads * model_dim) // num_heads
             for _ in range(effective_layers):
-                # Each LoRA adapter: down-project to rank, then up-project back
                 q_down = nn.Linear(model_dim, lora_rank, bias=False)
                 q_up = nn.Linear(lora_rank, model_dim, bias=False)
-                nn.init.zeros_(q_up.weight)  # zero-init so LoRA starts as identity
+                nn.init.zeros_(q_up.weight)  # zero-init: LoRA adds nothing at start
                 self.lora_q.append(nn.Sequential(q_down, q_up))
 
                 v_down = nn.Linear(model_dim, lora_rank, bias=False)
@@ -1290,10 +1275,9 @@ def main() -> None:
         if stop_after_step is None and reached_cap:
             stop_after_step = step
 
-        # SWA: collect checkpoints during warmdown
+        # SWA: snapshot weights at evenly-spaced steps during warmdown
         if args.swa_checkpoints > 0 and scale < 1.0:
             if not swa_collected:
-                # Calculate which steps to collect checkpoints
                 if stop_after_step is not None:
                     remaining = stop_after_step - step + 1
                 else:
@@ -1310,9 +1294,7 @@ def main() -> None:
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
 
-    # Apply SWA if we collected checkpoints during warmdown
     if swa_states:
-        # Also include the final checkpoint
         swa_states.append({k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()})
         log0(f"swa: averaging {len(swa_states)} checkpoints")
         avg_state = {}
