@@ -89,6 +89,7 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
     fake_quant_bits = int(os.environ.get("FAKE_QUANT_BITS", 0))  # 0=off, 6=int6 STE, 8=int8 STE
     swa_checkpoints = int(os.environ.get("SWA_CHECKPOINTS", 0))  # 0=off, 7=recommended
+    lora_rank = int(os.environ.get("LORA_RANK", 0))  # 0=off, 4=recommended for depth recurrence
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -322,12 +323,14 @@ def eval_val_sliding_window(
                 x0 = hidden
                 skips: list[Tensor] = []
                 for i in range(model.num_encoder_layers):
-                    hidden = model.blocks[i % model.num_unique_blocks](hidden, x0)
+                    lq, lv = model._get_lora(i)
+                    hidden = model.blocks[i % model.num_unique_blocks](hidden, x0, lora_q=lq, lora_v=lv)
                     skips.append(hidden)
                 for i in range(model.num_decoder_layers):
                     if skips:
                         hidden = hidden + model.skip_weights[i].to(dtype=hidden.dtype)[None, None, :] * skips.pop()
-                    hidden = model.blocks[(model.num_encoder_layers + i) % model.num_unique_blocks](hidden, x0)
+                    lq, lv = model._get_lora(model.num_encoder_layers + i)
+                    hidden = model.blocks[(model.num_encoder_layers + i) % model.num_unique_blocks](hidden, x0, lora_q=lq, lora_v=lv)
                 hidden = model.final_norm(hidden)
 
                 # Only score the last `stride` positions
@@ -688,11 +691,17 @@ class CausalSelfAttention(nn.Module):
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, lora_q: nn.Module | None = None, lora_v: nn.Module | None = None) -> Tensor:
         bsz, seqlen, dim = x.shape
-        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        q = self.c_q(x)
+        if lora_q is not None:
+            q = q + lora_q(x)
+        q = q.reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.c_v(x)
+        if lora_v is not None:
+            v = v + lora_v(x)
+        v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
@@ -744,10 +753,10 @@ class Block(nn.Module):
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor, lora_q: nn.Module | None = None, lora_v: nn.Module | None = None) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
+        attn_out = self.attn(self.attn_norm(x), lora_q=lora_q, lora_v=lora_v)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
@@ -768,6 +777,7 @@ class GPT(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         depth_recurrence: int = 1,
+        lora_rank: int = 0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -777,6 +787,7 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.depth_recurrence = depth_recurrence
         self.num_unique_blocks = num_layers
+        self.lora_rank = lora_rank
 
         effective_layers = num_layers * depth_recurrence
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
@@ -797,6 +808,23 @@ class GPT(nn.Module):
                 for i in range(num_layers)
             ]
         )
+        # Per-loop LoRA: one pair (Q, V) per virtual layer when depth_recurrence > 1
+        self.lora_q = nn.ModuleList()
+        self.lora_v = nn.ModuleList()
+        if lora_rank > 0 and depth_recurrence > 1:
+            kv_dim = (num_kv_heads * model_dim) // num_heads
+            for _ in range(effective_layers):
+                # Each LoRA adapter: down-project to rank, then up-project back
+                q_down = nn.Linear(model_dim, lora_rank, bias=False)
+                q_up = nn.Linear(lora_rank, model_dim, bias=False)
+                nn.init.zeros_(q_up.weight)  # zero-init so LoRA starts as identity
+                self.lora_q.append(nn.Sequential(q_down, q_up))
+
+                v_down = nn.Linear(model_dim, lora_rank, bias=False)
+                v_up = nn.Linear(lora_rank, kv_dim, bias=False)
+                nn.init.zeros_(v_up.weight)
+                self.lora_v.append(nn.Sequential(v_down, v_up))
+
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -810,6 +838,11 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
+    def _get_lora(self, virtual_idx: int) -> tuple[nn.Module | None, nn.Module | None]:
+        if self.lora_rank > 0 and len(self.lora_q) > 0:
+            return self.lora_q[virtual_idx], self.lora_v[virtual_idx]
+        return None, None
+
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
@@ -818,12 +851,14 @@ class GPT(nn.Module):
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i % self.num_unique_blocks](x, x0)
+            lq, lv = self._get_lora(i)
+            x = self.blocks[i % self.num_unique_blocks](x, x0, lora_q=lq, lora_v=lv)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[(self.num_encoder_layers + i) % self.num_unique_blocks](x, x0)
+            lq, lv = self._get_lora(self.num_encoder_layers + i)
+            x = self.blocks[(self.num_encoder_layers + i) % self.num_unique_blocks](x, x0, lora_q=lq, lora_v=lv)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -955,6 +990,7 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
         depth_recurrence=args.depth_recurrence,
+        lora_rank=args.lora_rank,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
