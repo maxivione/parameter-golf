@@ -80,6 +80,7 @@ class Hyperparameters:
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
+    muon_beta2 = float(os.environ.get("MUON_BETA2", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
@@ -90,6 +91,7 @@ class Hyperparameters:
     fake_quant_bits = int(os.environ.get("FAKE_QUANT_BITS", 0))  # 0=off, 6=int6 STE, 8=int8 STE
     swa_checkpoints = int(os.environ.get("SWA_CHECKPOINTS", 0))  # 0=off, 7=recommended
     lora_rank = int(os.environ.get("LORA_RANK", 0))  # 0=off, 4=recommended for depth recurrence
+    use_normuon = bool(int(os.environ.get("USE_NORMUON", 0)))  # 0=classic Muon, 1=NorMuon
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -114,11 +116,46 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
     return X.T if transposed else X
 
 
+def normuon_update(
+    grad: Tensor,
+    momentum_buf: Tensor,
+    second_momentum_buf: Tensor,
+    beta: float = 0.95,
+    beta2: float = 0.95,
+    ns_steps: int = 5,
+    nesterov: bool = True,
+) -> Tensor:
+    momentum_buf.lerp_(grad, 1 - beta)
+    update = grad.lerp_(momentum_buf, beta) if nesterov else momentum_buf
+    original_shape = None
+    if update.ndim == 4:
+        original_shape = update.shape
+        update = update.reshape(update.size(0), -1)
+    update = zeropower_via_newtonschulz5(update, steps=ns_steps)
+    update = update.to(grad.dtype)
+    if original_shape is not None:
+        update = update.reshape(original_shape)
+    # NorMuon: per-row second-moment normalization for stable updates
+    vnorm = update.norm(dim=(-2, -1), keepdim=True)
+    v_mean = torch.mean(update * update, dim=-1, keepdim=True)
+    second_momentum_buf.lerp_(v_mean, 1 - beta2)
+    step_size = 1 / second_momentum_buf.sqrt().add_(1e-10)
+    update.mul_(step_size)
+    vnorm_new = update.norm(dim=(-2, -1), keepdim=True)
+    update.mul_(vnorm / (vnorm_new.add_(1e-10)))
+    update *= max(1, grad.size(-2) / grad.size(-1)) ** 0.5
+    return update
+
+
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
+    # NorMuon: Muon with per-row second-moment normalization.
+    # When use_normuon=True, uses the normuon_update path from SOTA submissions.
+    def __init__(self, params, lr: float, momentum: float, backend_steps: int,
+                 nesterov: bool = True, beta2: float = 0.95, use_normuon: bool = False):
         super().__init__(
             params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
+            dict(lr=lr, momentum=momentum, backend_steps=backend_steps,
+                 nesterov=nesterov, beta2=beta2, use_normuon=use_normuon),
         )
 
     @torch.no_grad()
@@ -140,35 +177,65 @@ class Muon(torch.optim.Optimizer):
             momentum = group["momentum"]
             backend_steps = group["backend_steps"]
             nesterov = group["nesterov"]
+            use_normuon = group.get("use_normuon", False)
+            beta2 = group.get("beta2", 0.95)
 
-            total_params = sum(int(p.numel()) for p in params)
-            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
+            if use_normuon:
+                # NorMuon path: per-parameter update with second-moment normalization
+                # Sort params largest-first for better distributed load balance
+                params_sorted = sorted(params, key=lambda x: x.size(), reverse=True)
+                pad_count = (-len(params_sorted)) % world_size
+                params_pad = params_sorted + [torch.empty_like(params_sorted[-1]) for _ in range(pad_count)]
+                for base_i in range(0, len(params_pad), world_size):
+                    if base_i + rank < len(params_sorted):
+                        p = params_sorted[base_i + rank]
+                        if p.grad is None:
+                            p.grad = torch.zeros_like(p)
+                        state = self.state[p]
+                        if "momentum_buffer" not in state:
+                            state["momentum_buffer"] = torch.zeros_like(p)
+                            state["second_momentum_buffer"] = torch.zeros_like(p[..., 0:1])
+                        update = normuon_update(
+                            p.grad,
+                            state["momentum_buffer"],
+                            state["second_momentum_buffer"],
+                            beta=momentum,
+                            beta2=beta2,
+                            ns_steps=backend_steps,
+                            nesterov=nesterov,
+                        )
+                        p.add_(update.reshape(p.shape), alpha=-lr)
+                    if distributed:
+                        dist.all_gather(params_pad[base_i : base_i + world_size], params_pad[base_i + rank])
+            else:
+                # Classic Muon path
+                total_params = sum(int(p.numel()) for p in params)
+                updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
 
-            curr = 0
-            for i, p in enumerate(params):
-                if i % world_size == rank and p.grad is not None:
-                    g = p.grad
-                    state = self.state[p]
-                    if "momentum_buffer" not in state:
-                        state["momentum_buffer"] = torch.zeros_like(g)
-                    buf = state["momentum_buffer"]
-                    buf.mul_(momentum).add_(g)
-                    if nesterov:
-                        g = g.add(buf, alpha=momentum)
-                    g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-                    # Scale correction from Muon reference implementations.
-                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
-                    updates_flat[curr : curr + p.numel()] = g.reshape(-1)
-                curr += p.numel()
+                curr = 0
+                for i, p in enumerate(params):
+                    if i % world_size == rank and p.grad is not None:
+                        g = p.grad
+                        state = self.state[p]
+                        if "momentum_buffer" not in state:
+                            state["momentum_buffer"] = torch.zeros_like(g)
+                        buf = state["momentum_buffer"]
+                        buf.mul_(momentum).add_(g)
+                        if nesterov:
+                            g = g.add(buf, alpha=momentum)
+                        g = zeropower_via_newtonschulz5(g, steps=backend_steps)
+                        g *= max(1, g.size(0) / g.size(1)) ** 0.5
+                        updates_flat[curr : curr + p.numel()] = g.reshape(-1)
+                    curr += p.numel()
 
-            if distributed:
-                dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
+                if distributed:
+                    dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
 
-            curr = 0
-            for p in params:
-                g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
-                p.add_(g, alpha=-lr)
-                curr += p.numel()
+                curr = 0
+                for p in params:
+                    g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
+                    p.add_(g, alpha=-lr)
+                    curr += p.numel()
 
         return loss
 
@@ -598,17 +665,22 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
+INT6_CLIP_Q = 0.9999984  # quantile for outlier clipping — matches export
+
+
 def _fake_quantize_per_row(w: Tensor, bits: int) -> Tensor:
     # STE fake quantize: forward simulates post-training int-N quantization,
     # backward passes gradients through unchanged (straight-through estimator).
-    # Per-row quantization matches the actual int8/int6 export scheme.
+    # Uses quantile-based outlier clipping to match the actual export procedure.
     max_val = (1 << (bits - 1)) - 1  # 127 for int8, 31 for int6
     with torch.no_grad():
-        row_abs_max = w.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
-        scale = row_abs_max / max_val
-    q = (w / scale).round().clamp(-max_val, max_val)
+        w32 = w.float()
+        clip_abs = torch.quantile(w32.abs(), INT6_CLIP_Q, dim=1).clamp_min(1e-8)
+        scale = clip_abs / max_val
+        w_clipped = torch.clamp(w32, -clip_abs[:, None], clip_abs[:, None])
+        w_q = (torch.round(w_clipped / scale[:, None]) * scale[:, None]).to(w.dtype)
     # STE: forward uses quantized weights, backward passes through
-    return w + (q * scale - w).detach()
+    return w + (w_q - w).detach()
 
 
 class CastedLinear(nn.Linear):
@@ -1029,6 +1101,8 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
+        beta2=args.muon_beta2,
+        use_normuon=args.use_normuon,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
