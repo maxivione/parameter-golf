@@ -70,6 +70,7 @@ class Hyperparameters:
     num_heads: int = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
     mlp_mult: int = int(os.environ.get("MLP_MULT", 2))
+    depth_recurrence: int = int(os.environ.get("DEPTH_RECURRENCE", 1))
     tie_embeddings: bool = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     tied_embed_init_std: float = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     logit_chunk_tokens: int = int(os.environ.get("LOGIT_CHUNK_TOKENS", 0))
@@ -91,6 +92,7 @@ class Hyperparameters:
     grad_clip_norm: float = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
     out_dir: str = os.environ.get("OUT_DIR", "logs")
+    skip_int8_roundtrip: bool = bool(int(os.environ.get("SKIP_INT8_ROUNDTRIP", "0")))
 
     @property
     def train_files(self) -> str:
@@ -380,18 +382,22 @@ class GPT(nn.Module):
     # - encoder half accumulates skip tensors
     # - decoder half consumes reversed skips with learned skip_weights
     # - tied embeddings for the LM head (the baseline default setup)
+    # - depth_recurrence > 1: loop num_layers unique blocks multiple times
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+                 qk_gain_init: float, depth_recurrence: int = 1):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
+        self.depth_recurrence = depth_recurrence
+        self.num_unique_blocks = num_layers
 
+        effective_layers = num_layers * depth_recurrence
         self.tok_emb = nn.Embedding(vocab_size, dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
+        self.num_encoder_layers = effective_layers // 2
+        self.num_decoder_layers = effective_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
         self.blocks = [
@@ -417,15 +423,12 @@ class GPT(nn.Module):
         skips: list[mx.array] = []
 
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self.blocks[i % self.num_unique_blocks](x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
-            # Odd layer counts have one more decoder block than encoder block. The baseline only
-            # applies a skip connection when one exists, then runs the remaining decoder block(s)
-            # without an added skip.
             if skips:
                 x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x = self.blocks[(self.num_encoder_layers + i) % self.num_unique_blocks](x, x0)
         return self.final_norm(x)
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
@@ -760,14 +763,12 @@ def eval_val(
     has_leading_space_lut: np.ndarray,
     is_boundary_token_lut: np.ndarray,
 ) -> tuple[float, float]:
-    # Validation computes two metrics:
-    # - val_loss: token cross-entropy (natural log)
-    # - val_bpb: tokenizer-agnostic compression metric used by the challenge
-    val_batch_tokens = args.val_batch_size // args.grad_accum_steps
+    # Validation uses VAL_BATCH_SIZE directly (not divided by GRAD_ACCUM_STEPS).
+    val_batch_tokens = args.val_batch_size
     if val_batch_tokens < args.train_seq_len:
         raise ValueError(
             "VAL_BATCH_SIZE must provide at least one sequence; "
-            f"got VAL_BATCH_SIZE={args.val_batch_size}, GRAD_ACCUM_STEPS={args.grad_accum_steps}, "
+            f"got VAL_BATCH_SIZE={args.val_batch_size}, "
             f"TRAIN_SEQ_LEN={args.train_seq_len}"
         )
     val_batch_seqs = val_batch_tokens // args.train_seq_len
@@ -775,7 +776,9 @@ def eval_val(
     total_loss = mx.array(0.0, dtype=mx.float32)
     total_tokens = 0.0
     total_bytes = 0.0
-    for batch_seq_start in range(0, total_seqs, val_batch_seqs):
+    # Materialize every ~100k tokens to bound MLX graph memory on constrained devices.
+    eval_interval = max(100_000 // max(val_batch_tokens, 1), 1)
+    for batch_idx, batch_seq_start in enumerate(range(0, total_seqs, val_batch_seqs)):
         batch_seq_end = min(batch_seq_start + val_batch_seqs, total_seqs)
         raw_start = batch_seq_start * args.train_seq_len
         raw_end = batch_seq_end * args.train_seq_len + 1
@@ -794,6 +797,8 @@ def eval_val(
         ).astype(np.int16, copy=False)
         total_tokens += chunk_token_count
         total_bytes += float(bytes_np.astype(np.float64).sum())
+        if (batch_idx + 1) % eval_interval == 0:
+            mx.eval(total_loss)
     total_loss = total_loss / total_tokens
     mx.eval(total_loss)
     val_loss = float(total_loss.item())
@@ -885,6 +890,7 @@ def main() -> None:
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
+        depth_recurrence=args.depth_recurrence,
     )
     opt = SplitOptimizers(model, args)
 
@@ -921,6 +927,7 @@ def main() -> None:
     log(f"tokenizer_path:{args.tokenizer_path}")
     log(
         f"model_params:{n_params} vocab_size:{args.vocab_size} layers:{args.num_layers} "
+        f"depth_recurrence:{args.depth_recurrence} effective_layers:{args.num_layers * args.depth_recurrence} "
         f"dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
         f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
     )
@@ -966,11 +973,11 @@ def main() -> None:
                 log(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
 
         # Prime the standalone eval graph once too. It is compiled separately from value_and_grad.
-        val_batch_tokens = args.val_batch_size // args.grad_accum_steps
+        val_batch_tokens = args.val_batch_size
         if val_batch_tokens < args.train_seq_len:
             raise ValueError(
                 "VAL_BATCH_SIZE must provide at least one sequence; "
-                f"got VAL_BATCH_SIZE={args.val_batch_size}, GRAD_ACCUM_STEPS={args.grad_accum_steps}, "
+                f"got VAL_BATCH_SIZE={args.val_batch_size}, "
                 f"TRAIN_SEQ_LEN={args.train_seq_len}"
             )
         warm_val_seqs = min(val_batch_tokens // args.train_seq_len, (val_tokens.size - 1) // args.train_seq_len)
@@ -1066,22 +1073,25 @@ def main() -> None:
         f"(payload:{quant_stats['int8_payload_bytes']} raw_pickle:{quant_serialized_bytes} payload_ratio:{ratio:.2f}x)"
     )
 
-    with quant_path.open("rb") as f:
-        quant_blob_disk = f.read()
-    quant_flat = dequantize_state_dict_int8(pickle.loads(zlib.decompress(quant_blob_disk)))
-    model.update(tree_unflatten(list(quant_flat.items())))
-    q_t0 = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
-        args,
-        compiled_loss,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
-    )
-    q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
-    log(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
-    log(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    if args.skip_int8_roundtrip:
+        log("skip_int8_roundtrip:1 (skipping quantized roundtrip validation)")
+    else:
+        with quant_path.open("rb") as f:
+            quant_blob_disk = f.read()
+        quant_flat = dequantize_state_dict_int8(pickle.loads(zlib.decompress(quant_blob_disk)))
+        model.update(tree_unflatten(list(quant_flat.items())))
+        q_t0 = time.perf_counter()
+        q_val_loss, q_val_bpb = eval_val(
+            args,
+            compiled_loss,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        )
+        q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
+        log(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
+        log(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
 
 if __name__ == "__main__":
