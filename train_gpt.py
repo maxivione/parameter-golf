@@ -48,6 +48,7 @@ class Hyperparameters:
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
+    sliding_window_stride = int(os.environ.get("SLIDING_WINDOW_STRIDE", 0))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
     # Training length.
@@ -66,6 +67,7 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    depth_recurrence = int(os.environ.get("DEPTH_RECURRENCE", 1))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -262,6 +264,91 @@ def eval_val(
             val_token_count += batch_token_count
             prev_ids = x.reshape(-1)
             tgt_ids = y.reshape(-1)
+            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+            val_byte_count += token_bytes.to(torch.float64).sum()
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = val_loss_sum / val_token_count
+    bits_per_token = val_loss.item() / math.log(2.0)
+    tokens_per_byte = val_token_count.item() / val_byte_count.item()
+    model.train()
+    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def eval_val_sliding_window(
+    args: Hyperparameters,
+    model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    stride: int,
+) -> tuple[float, float]:
+    # Sliding window evaluation: score each token with near-maximum context.
+    # For each window of seq_len tokens, only the last `stride` tokens are scored.
+    # This gives each scored token at least (seq_len - stride) context tokens.
+    seq_len = args.train_seq_len
+    total_tokens_available = val_tokens.numel() - 1  # -1 because we need target
+    # Generate all window start positions
+    window_starts = list(range(0, total_tokens_available - seq_len + 1, stride))
+    # Distribute windows across ranks
+    rank_starts = window_starts[rank::world_size]
+
+    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
+    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    model.eval()
+    with torch.inference_mode():
+        for start in rank_starts:
+            window = val_tokens[start : start + seq_len + 1].to(device=device, dtype=torch.int64)
+            x = window[:-1].unsqueeze(0)  # (1, seq_len)
+            y = window[1:].unsqueeze(0)   # (1, seq_len)
+
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                # Get logits for the full window but only score the last `stride` tokens
+                hidden = model.tok_emb(x)
+                hidden = F.rms_norm(hidden, (hidden.size(-1),))
+                x0 = hidden
+                skips: list[Tensor] = []
+                for i in range(model.num_encoder_layers):
+                    hidden = model.blocks[i % model.num_unique_blocks](hidden, x0)
+                    skips.append(hidden)
+                for i in range(model.num_decoder_layers):
+                    if skips:
+                        hidden = hidden + model.skip_weights[i].to(dtype=hidden.dtype)[None, None, :] * skips.pop()
+                    hidden = model.blocks[(model.num_encoder_layers + i) % model.num_unique_blocks](hidden, x0)
+                hidden = model.final_norm(hidden)
+
+                # Only score the last `stride` positions
+                score_start = seq_len - stride
+                # Handle first window: score all positions (no prior context)
+                if start == 0:
+                    score_start = 0
+                h_score = hidden[:, score_start:, :].reshape(-1, hidden.size(-1))
+                t_score = y[:, score_start:].reshape(-1)
+
+                if model.tie_embeddings:
+                    logits = F.linear(h_score, model.tok_emb.weight)
+                else:
+                    logits = model.lm_head(h_score)
+                logits = model.logit_softcap * torch.tanh(logits / model.logit_softcap)
+                loss = F.cross_entropy(logits.float(), t_score, reduction="sum")
+
+            n_scored = t_score.numel()
+            val_loss_sum += loss.to(torch.float64)
+            val_token_count += float(n_scored)
+            # Byte counting for BPB
+            prev_ids = x[:, score_start:].reshape(-1)
+            tgt_ids = t_score
             token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
             token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
             val_byte_count += token_bytes.to(torch.float64).sum()
@@ -659,6 +746,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        depth_recurrence: int = 1,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -666,9 +754,13 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.depth_recurrence = depth_recurrence
+        self.num_unique_blocks = num_layers
+
+        effective_layers = num_layers * depth_recurrence
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
+        self.num_encoder_layers = effective_layers // 2
+        self.num_decoder_layers = effective_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList(
@@ -705,12 +797,12 @@ class GPT(nn.Module):
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self.blocks[i % self.num_unique_blocks](x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x = self.blocks[(self.num_encoder_layers + i) % self.num_unique_blocks](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -733,7 +825,12 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    _use_compile = True
+    try:
+        import triton  # noqa: F401
+    except ImportError:
+        _use_compile = False
+    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5) if _use_compile else zeropower_via_newtonschulz5
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -763,10 +860,10 @@ def main() -> None:
     torch.backends.cudnn.allow_tf32 = True
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
 
-    enable_cudnn_sdp(False)
+    enable_cudnn_sdp(True)
     enable_flash_sdp(True)
-    enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
+    enable_mem_efficient_sdp(True)
+    enable_math_sdp(True)
 
     logfile = None
     if master_process:
@@ -835,12 +932,13 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        depth_recurrence=args.depth_recurrence,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if _use_compile else base_model
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -893,7 +991,9 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
+    effective_layers = args.num_layers * args.depth_recurrence
     log0(f"model_params:{n_params}")
+    log0(f"num_layers:{args.num_layers} depth_recurrence:{args.depth_recurrence} effective_layers:{effective_layers}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -1117,6 +1217,29 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+
+    if args.sliding_window_stride > 0:
+        torch.cuda.synchronize()
+        t_sw = time.perf_counter()
+        sw_val_loss, sw_val_bpb = eval_val_sliding_window(
+            args,
+            model,
+            rank,
+            world_size,
+            device,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            stride=args.sliding_window_stride,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_sliding_window_eval stride:{args.sliding_window_stride} "
+            f"val_loss:{sw_val_loss:.4f} val_bpb:{sw_val_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_sw):.0f}ms"
+        )
+        log0(f"final_sliding_window_eval_exact stride:{args.sliding_window_stride} val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
