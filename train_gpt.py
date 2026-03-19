@@ -87,6 +87,8 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    fake_quant_bits = int(os.environ.get("FAKE_QUANT_BITS", 0))  # 0=off, 6=int6 STE, 8=int8 STE
+    swa_checkpoints = int(os.environ.get("SWA_CHECKPOINTS", 0))  # 0=off, 7=recommended
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -593,11 +595,30 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
+def _fake_quantize_per_row(w: Tensor, bits: int) -> Tensor:
+    # STE fake quantize: forward simulates post-training int-N quantization,
+    # backward passes gradients through unchanged (straight-through estimator).
+    # Per-row quantization matches the actual int8/int6 export scheme.
+    max_val = (1 << (bits - 1)) - 1  # 127 for int8, 31 for int6
+    with torch.no_grad():
+        row_abs_max = w.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+        scale = row_abs_max / max_val
+    q = (w / scale).round().clamp(-max_val, max_val)
+    # STE: forward uses quantized weights, backward passes through
+    return w + (q * scale - w).detach()
+
+
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
+    # Optional STE fake quantization for quantization-aware training.
+    fake_quant_bits: int = 0  # set by main() from args.fake_quant_bits
+
     def forward(self, x: Tensor) -> Tensor:
+        w = self.weight.to(x.dtype)
+        if self.training and CastedLinear.fake_quant_bits > 0 and w.ndim == 2:
+            w = _fake_quantize_per_row(w, CastedLinear.fake_quant_bits)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        return F.linear(x, w, bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -825,6 +846,7 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    CastedLinear.fake_quant_bits = args.fake_quant_bits
     _use_compile = True
     try:
         import triton  # noqa: F401
@@ -1066,6 +1088,10 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    swa_states: list[dict[str, Tensor]] = []
+    swa_collected = False
+    swa_next_step = 0
+    swa_interval = 1
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1154,10 +1180,37 @@ def main() -> None:
         if stop_after_step is None and reached_cap:
             stop_after_step = step
 
+        # SWA: collect checkpoints during warmdown
+        if args.swa_checkpoints > 0 and scale < 1.0:
+            if not swa_collected:
+                # Calculate which steps to collect checkpoints
+                if stop_after_step is not None:
+                    remaining = stop_after_step - step + 1
+                else:
+                    remaining = args.iterations - step + 1
+                swa_interval = max(remaining // args.swa_checkpoints, 1)
+                swa_next_step = step
+                swa_collected = True
+            if step >= swa_next_step and len(swa_states) < args.swa_checkpoints:
+                swa_states.append({k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()})
+                swa_next_step = step + swa_interval
+
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+
+    # Apply SWA if we collected checkpoints during warmdown
+    if swa_states:
+        # Also include the final checkpoint
+        swa_states.append({k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()})
+        log0(f"swa: averaging {len(swa_states)} checkpoints")
+        avg_state = {}
+        for key in swa_states[0]:
+            stacked = torch.stack([s[key].float() for s in swa_states])
+            avg_state[key] = stacked.mean(dim=0).to(dtype=swa_states[0][key].dtype)
+        base_model.load_state_dict(avg_state, strict=True)
+        del swa_states  # free memory
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
