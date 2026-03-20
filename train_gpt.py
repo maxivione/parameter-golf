@@ -95,6 +95,8 @@ class Hyperparameters:
     swa_checkpoints = int(os.environ.get("SWA_CHECKPOINTS", 0))  # 0=off, 7=recommended
     lora_rank = int(os.environ.get("LORA_RANK", 0))  # 0=off, 4=recommended for depth recurrence
     use_normuon = bool(int(os.environ.get("USE_NORMUON", 0)))  # 0=classic Muon, 1=NorMuon
+    muon_wd = float(os.environ.get("MUON_WD", 0.0))  # decoupled weight decay for Muon
+    adam_wd = float(os.environ.get("ADAM_WD", 0.0))  # weight decay for Adam (embeddings/scalars)
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -153,11 +155,13 @@ def normuon_update(
 class Muon(torch.optim.Optimizer):
     # use_normuon=True adds per-row second-moment normalization after NS5 (from modded-nanogpt).
     def __init__(self, params, lr: float, momentum: float, backend_steps: int,
-                 nesterov: bool = True, beta2: float = 0.95, use_normuon: bool = False):
+                 nesterov: bool = True, beta2: float = 0.95, use_normuon: bool = False,
+                 weight_decay: float = 0.0):
         super().__init__(
             params,
             dict(lr=lr, momentum=momentum, backend_steps=backend_steps,
-                 nesterov=nesterov, beta2=beta2, use_normuon=use_normuon),
+                 nesterov=nesterov, beta2=beta2, use_normuon=use_normuon,
+                 weight_decay=weight_decay),
         )
 
     @torch.no_grad()
@@ -181,6 +185,7 @@ class Muon(torch.optim.Optimizer):
             nesterov = group["nesterov"]
             use_normuon = group.get("use_normuon", False)
             beta2 = group.get("beta2", 0.95)
+            wd = group.get("weight_decay", 0.0)
 
             if use_normuon:
                 params_sorted = sorted(params, key=lambda x: x.size(), reverse=True)
@@ -204,6 +209,8 @@ class Muon(torch.optim.Optimizer):
                             ns_steps=backend_steps,
                             nesterov=nesterov,
                         )
+                        if wd > 0:
+                            p.mul_(1 - lr * wd)
                         p.add_(update.reshape(p.shape), alpha=-lr)
                     if distributed:
                         dist.all_gather(params_pad[base_i : base_i + world_size], params_pad[base_i + rank])
@@ -234,6 +241,8 @@ class Muon(torch.optim.Optimizer):
                 curr = 0
                 for p in params:
                     g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
+                    if wd > 0:
+                        p.mul_(1 - lr * wd)
                     p.add_(g, alpha=-lr)
                     curr += p.numel()
 
@@ -1161,10 +1170,11 @@ def main() -> None:
             for p in base_model.bigram.proj.parameters():
                 matrix_params.append(p)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    optimizer_tok = torch.optim.Adam(
+    optimizer_tok = torch.optim.AdamW(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
+        weight_decay=args.adam_wd,
         fused=True,
     )
     optimizer_muon = Muon(
@@ -1174,13 +1184,15 @@ def main() -> None:
         backend_steps=args.muon_backend_steps,
         beta2=args.muon_beta2,
         use_normuon=args.use_normuon,
+        weight_decay=args.muon_wd,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    optimizer_scalar = torch.optim.Adam(
+    optimizer_scalar = torch.optim.AdamW(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
+        weight_decay=args.adam_wd,
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
