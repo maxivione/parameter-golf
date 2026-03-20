@@ -16,6 +16,11 @@ import subprocess
 import sys
 import time
 import uuid
+try:
+    import zstandard as zstd
+    HAS_ZSTD = True
+except ImportError:
+    HAS_ZSTD = False
 import zlib
 from pathlib import Path
 
@@ -93,10 +98,13 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
     fake_quant_bits = int(os.environ.get("FAKE_QUANT_BITS", 0))  # 0=off, 6=int6 STE, 8=int8 STE
     swa_checkpoints = int(os.environ.get("SWA_CHECKPOINTS", 0))  # 0=off, 7=recommended
+    swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.5))  # start SWA at this fraction of training
+    swa_every = int(os.environ.get("SWA_EVERY", 200))  # collect SWA checkpoint every N steps
     lora_rank = int(os.environ.get("LORA_RANK", 0))  # 0=off, 4=recommended for depth recurrence
     use_normuon = bool(int(os.environ.get("USE_NORMUON", 0)))  # 0=classic Muon, 1=NorMuon
     muon_wd = float(os.environ.get("MUON_WD", 0.0))  # decoupled weight decay for Muon
     adam_wd = float(os.environ.get("ADAM_WD", 0.0))  # weight decay for Adam (embeddings/scalars)
+    use_zstd = bool(int(os.environ.get("USE_ZSTD", 0)))  # 0=zlib, 1=zstd-22
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1373,19 +1381,12 @@ def main() -> None:
         if stop_after_step is None and reached_cap:
             stop_after_step = step
 
-        # SWA: snapshot weights at evenly-spaced steps during warmdown
-        if args.swa_checkpoints > 0 and scale < 1.0:
-            if not swa_collected:
-                if stop_after_step is not None:
-                    remaining = stop_after_step - step + 1
-                else:
-                    remaining = args.iterations - step + 1
-                swa_interval = max(remaining // args.swa_checkpoints, 1)
-                swa_next_step = step
-                swa_collected = True
-            if step >= swa_next_step and len(swa_states) < args.swa_checkpoints:
+        # SWA: collect checkpoints every swa_every steps after swa_start_frac of training
+        if args.swa_checkpoints > 0:
+            total_steps = stop_after_step if stop_after_step is not None else args.iterations
+            swa_start_step = int(total_steps * args.swa_start_frac)
+            if step >= swa_start_step and step % args.swa_every == 0:
                 swa_states.append({k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()})
-                swa_next_step = step + swa_interval
 
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
@@ -1420,7 +1421,13 @@ def main() -> None:
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
+    if args.use_zstd and HAS_ZSTD:
+        cctx = zstd.ZstdCompressor(level=22)
+        quant_blob = cctx.compress(quant_raw)
+        compress_name = "zstd22"
+    else:
+        quant_blob = zlib.compress(quant_raw, level=9)
+        compress_name = "zlib"
     quant_raw_bytes = len(quant_raw)
     if master_process:
         with open("final_model.int8.ptz", "wb") as f:
@@ -1429,16 +1436,20 @@ def main() -> None:
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
         log0(
-            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
+            f"Serialized model int6+{compress_name}: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Total submission size int6+{compress_name}: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
         dist.barrier()
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+    if args.use_zstd and HAS_ZSTD:
+        dctx = zstd.ZstdDecompressor()
+        quant_state = torch.load(io.BytesIO(dctx.decompress(quant_blob_disk)), map_location="cpu")
+    else:
+        quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
@@ -1456,10 +1467,10 @@ def main() -> None:
     )
     torch.cuda.synchronize()
     log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"final_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
-    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"final_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
     if args.sliding_window_stride > 0:
         torch.cuda.synchronize()
