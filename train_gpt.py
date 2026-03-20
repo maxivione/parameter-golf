@@ -1,9 +1,3 @@
-"""
-The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching-off points for new participants, not SOTA configs. We'll accept PRs that tune, improve, or simplify these scripts without significantly increasing complexity, but competitive submissions should stay in the `/records` folder.
-
-Hard stop: To keep readable for newcomers, let's make sure `train_gpt.py` and `train_gpt_mlx.py` never are longer than 1500 lines.
-"""
-
 from __future__ import annotations
 
 import copy
@@ -62,8 +56,6 @@ class Hyperparameters:
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
-    seq_len_start = int(os.environ.get("SEQ_LEN_START", 0))  # 0=disabled, e.g. 512 to start short
-    seq_len_warmup_frac = float(os.environ.get("SEQ_LEN_WARMUP_FRAC", 0.6))  # anneal to full over this fraction of wallclock
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -1335,28 +1327,12 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        # Sequence length warmup: step through powers of 2 from seq_len_start to train_seq_len
-        if args.seq_len_start > 0 and max_wallclock_ms is not None:
-            warmup_end_ms = max_wallclock_ms * args.seq_len_warmup_frac
-            t = min(elapsed_ms / max(warmup_end_ms, 1.0), 1.0)
-            # Build list of valid power-of-2 seq lengths between start and target
-            valid_lens = []
-            s = args.seq_len_start
-            while s <= args.train_seq_len:
-                valid_lens.append(s)
-                s *= 2
-            if valid_lens[-1] != args.train_seq_len:
-                valid_lens.append(args.train_seq_len)
-            idx = min(int(t * len(valid_lens)), len(valid_lens) - 1)
-            current_seq_len = valid_lens[idx]
-        else:
-            current_seq_len = args.train_seq_len
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-            x, y = train_loader.next_batch(args.train_batch_tokens, current_seq_len, grad_accum_steps)
+            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
