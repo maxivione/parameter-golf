@@ -1391,11 +1391,10 @@ def main() -> None:
         if stop_after_step is None and reached_cap:
             stop_after_step = step
 
-        # SWA: collect checkpoints every swa_every steps after swa_start_frac of training
-        if args.swa_checkpoints > 0:
-            total_steps = stop_after_step if stop_after_step is not None else args.iterations
-            swa_start_step = int(total_steps * args.swa_start_frac)
-            if step >= swa_start_step and step % args.swa_every == 0:
+        # SWA: collect every swa_every steps after swa_start_frac of wallclock time
+        if args.swa_checkpoints > 0 and max_wallclock_ms is not None:
+            wallclock_frac = approx_training_time_ms / max_wallclock_ms
+            if wallclock_frac >= args.swa_start_frac and step % args.swa_every == 0:
                 swa_states.append({k: v.detach().cpu().clone() for k, v in base_model.state_dict().items()})
 
     log0(
