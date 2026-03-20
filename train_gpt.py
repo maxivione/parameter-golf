@@ -68,6 +68,9 @@ class Hyperparameters:
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     depth_recurrence = int(os.environ.get("DEPTH_RECURRENCE", 1))
+    lora_rank = int(os.environ.get("LORA_RANK", 0))
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 0))  # 0=off, 4096=SOTA
+    bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -381,7 +384,10 @@ def eval_val_sliding_window(
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 hidden = model.tok_emb(x)
+                if model.bigram is not None:
+                    hidden = hidden + model.bigram(x)
                 hidden = F.rms_norm(hidden, (hidden.size(-1),))
+                hidden = model.smear(hidden)
                 x0 = hidden
                 skips: list[Tensor] = []
                 for i in range(model.num_encoder_layers):
@@ -807,6 +813,45 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
+class SmearGate(nn.Module):
+    """Blend each token's embedding with the previous token's via a learned gate."""
+    def __init__(self, dim: int):
+        super().__init__()
+        self.gate = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+
+    def forward(self, x: Tensor) -> Tensor:
+        g = torch.sigmoid(self.gate.to(dtype=x.dtype))[None, None, :]
+        x_prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
+        return (1 - g) * x + g * x_prev
+
+
+class BigramHashEmbedding(nn.Module):
+    """Hash consecutive token pairs into a learned embedding table."""
+    def __init__(self, bigram_vocab_size: int, bigram_dim: int, model_dim: int):
+        super().__init__()
+        self.bigram_vocab_size = bigram_vocab_size
+        self.embed = nn.Embedding(bigram_vocab_size, bigram_dim)
+        nn.init.zeros_(self.embed.weight)
+        self.proj = CastedLinear(bigram_dim, model_dim, bias=False) if bigram_dim != model_dim else None
+        if self.proj is not None:
+            nn.init.zeros_(self.proj.weight)
+        self.scale = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
+
+    def bigram_hash(self, tokens: Tensor) -> Tensor:
+        t = tokens.to(torch.int32)
+        mod = self.bigram_vocab_size - 1
+        out = torch.empty_like(t)
+        out[..., 0] = mod
+        out[..., 1:] = torch.bitwise_xor(36313 * t[..., 1:], 27191 * t[..., :-1]) % mod
+        return out.long()
+
+    def forward(self, token_ids: Tensor) -> Tensor:
+        h = self.embed(self.bigram_hash(token_ids))
+        if self.proj is not None:
+            h = self.proj(h)
+        return h * self.scale.to(dtype=h.dtype)
+
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -851,6 +896,8 @@ class GPT(nn.Module):
         qk_gain_init: float,
         depth_recurrence: int = 1,
         lora_rank: int = 0,
+        bigram_vocab_size: int = 0,
+        bigram_dim: int = 128,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -864,6 +911,8 @@ class GPT(nn.Module):
 
         effective_layers = num_layers * depth_recurrence
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
+        self.smear = SmearGate(model_dim)
         self.num_encoder_layers = effective_layers // 2
         self.num_decoder_layers = effective_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -906,9 +955,17 @@ class GPT(nn.Module):
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
-        for module in self.modules():
-            if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
-                nn.init.zeros_(module.weight)
+        effective_layers = self.num_unique_blocks * self.depth_recurrence
+        for name, module in self.named_modules():
+            if isinstance(module, nn.Linear):
+                if getattr(module, "_zero_init", False):
+                    nn.init.zeros_(module.weight)
+                elif module.weight.ndim == 2 and min(module.weight.shape) >= 64:
+                    nn.init.orthogonal_(module.weight, gain=1.0)
+                    # muP: scale output projections by 1/sqrt(2*effective_layers)
+                    if ".proj." in name or name.endswith(".proj"):
+                        with torch.no_grad():
+                            module.weight.mul_(1.0 / math.sqrt(2 * effective_layers))
 
     def _get_lora(self, virtual_idx: int) -> tuple[nn.Module | None, nn.Module | None]:
         if self.lora_rank > 0 and len(self.lora_q) > 0:
@@ -917,7 +974,10 @@ class GPT(nn.Module):
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
+        if self.bigram is not None:
+            x = x + self.bigram(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
+        x = self.smear(x)
         x0 = x
         skips: list[Tensor] = []
 
@@ -1063,6 +1123,8 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         depth_recurrence=args.depth_recurrence,
         lora_rank=args.lora_rank,
+        bigram_vocab_size=args.bigram_vocab_size,
+        bigram_dim=args.bigram_dim,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1089,6 +1151,15 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    # SmearGate and BigramHash params
+    scalar_params.append(base_model.smear.gate)
+    if base_model.bigram is not None:
+        scalar_params.append(base_model.bigram.scale)
+        for p in base_model.bigram.embed.parameters():
+            scalar_params.append(p)
+        if base_model.bigram.proj is not None:
+            for p in base_model.bigram.proj.parameters():
+                matrix_params.append(p)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1383,7 +1454,7 @@ def main() -> None:
         t_sw = time.perf_counter()
         sw_val_loss, sw_val_bpb = eval_val_sliding_window(
             args,
-            model,
+            getattr(model, 'module', model),
             rank,
             world_size,
             device,
