@@ -1335,12 +1335,20 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        # Sequence length warmup: anneal from seq_len_start to train_seq_len
+        # Sequence length warmup: step through powers of 2 from seq_len_start to train_seq_len
         if args.seq_len_start > 0 and max_wallclock_ms is not None:
             warmup_end_ms = max_wallclock_ms * args.seq_len_warmup_frac
             t = min(elapsed_ms / max(warmup_end_ms, 1.0), 1.0)
-            raw_len = int(args.seq_len_start + t * (args.train_seq_len - args.seq_len_start))
-            current_seq_len = max(raw_len - raw_len % 64, 64)  # round down to multiple of 64
+            # Build list of valid power-of-2 seq lengths between start and target
+            valid_lens = []
+            s = args.seq_len_start
+            while s <= args.train_seq_len:
+                valid_lens.append(s)
+                s *= 2
+            if valid_lens[-1] != args.train_seq_len:
+                valid_lens.append(args.train_seq_len)
+            idx = min(int(t * len(valid_lens)), len(valid_lens) - 1)
+            current_seq_len = valid_lens[idx]
         else:
             current_seq_len = args.train_seq_len
         zero_grad_all()
